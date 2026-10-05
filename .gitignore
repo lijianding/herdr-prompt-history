@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Logs & temp files
+*.log
+*.pid
+/tmp/
+
+# Node
+node_modules/
+package-lock.json

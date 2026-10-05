@@ -1,0 +1,40 @@
+id = "herdr-prompt-history"
+name = "Prompt History & Agent Inspector"
+version = "0.3.0"
+min_herdr_version = "0.9.0"
+description = "Show session prompt history, workspace tree, and sync agent tasks to sidebar."
+platforms = ["linux", "macos", "windows"]
+
+# 0. 随 Herdr 启动自动拉起后台 Agent 任务内容同步器（方案 B 核心）
+[[startup]]
+command = ["bash", "scripts/start_task_daemon.sh"]
+
+# 1. 右侧历史提示词面板
+[[panes]]
+id = "prompt-viewer"
+title = "Prompt History"
+placement = "split"
+command = ["node", "scripts/viewer.js"]
+
+[[actions]]
+id = "toggle-viewer"
+title = "Toggle Prompt History"
+command = ["bash", "scripts/toggle.sh"]
+
+# 2. 空间与页签两级交互式树状导航面板
+[[panes]]
+id = "tree-navigator"
+title = "Workspace Tree"
+placement = "split"
+command = ["node", "scripts/tree_navigator.js"]
+
+[[actions]]
+id = "toggle-tree"
+title = "Toggle Workspace Tree"
+command = ["bash", "scripts/toggle_tree.sh"]
+
+# 3. 手动同步 Agent 任务到左下角侧边栏
+[[actions]]
+id = "sync-tasks"
+title = "Sync Agent Tasks"
+command = ["node", "scripts/task_daemon.js"]
