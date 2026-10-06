@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
- * Herdr Agent 任务同步守护进程
- * 定时检测所有处于活跃运行状态的 Agent（Pi, Codex, Claude），
- * 提取其最新任务提示词摘要，并通过官方通道注入为 Pane 的 $task 元数据。
+ * Herdr Agent 任务同步守护进程 (v0.3.1)
+ * 修复：各 Agent（特别是 Codex）在不同页签/工作区下各自独立提取任务，杜绝全局污染。
  */
 
 const { execSync } = require('child_process');
@@ -24,82 +23,105 @@ function runCmd(args) {
 // 缓存上一次为每个 pane 报告的任务文本，避免重复调用
 const lastReportedTask = {};
 
+/**
+ * 为特定的 Pane 提取其专有的任务内容，确保不同页签互不干扰
+ */
 function getLatestTaskForPane(pane) {
   const agent = (pane.agent || '').toLowerCase();
   const cwd = pane.foreground_cwd || pane.cwd || '';
 
-  // 1. 如果是 Pi，直接从 Herdr 暴露的 session_path 中读取
-  if (agent === 'pi' && pane.agent_session && pane.agent_session.value) {
-    const sessionFile = pane.agent_session.value;
-    if (fs.existsSync(sessionFile)) {
-      try {
-        const lines = fs.readFileSync(sessionFile, 'utf-8').trim().split('\n');
-        for (let i = lines.length - 1; i >= Math.max(0, lines.length - 30); i--) {
-          const item = JSON.parse(lines[i]);
-          if (item.message && item.message.role === 'user') {
-            const content = item.message.content || [];
-            const textParts = content.filter(c => c.type === 'text' && c.text).map(c => c.text.trim());
-            const full = textParts.join(' ').trim();
-            if (full) return full;
-          }
-        }
-      } catch (_) {}
-    }
-  }
-
-  // 2. 如果是 Codex，优先查看 ~/.codex/history.jsonl
+  // 1. 针对 Codex：Codex 原生会将当前页签的独立任务通过 OSC 写入终端标题（格式：任务名称 | 工作区名称）
+  // 必须优先按当前 Pane 的终端标题提取，绝对不能直接读取全局 history.jsonl
   if (agent === 'codex') {
-    const codexHistory = path.join(HOME, '.codex', 'history.jsonl');
-    if (fs.existsSync(codexHistory)) {
-      try {
-        const lines = fs.readFileSync(codexHistory, 'utf-8').trim().split('\n');
-        for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
-          const item = JSON.parse(lines[i]);
-          if (item.text && item.text.trim()) {
-            return item.text.trim();
+    const title = (pane.terminal_title_stripped || pane.terminal_title || '').trim();
+    if (title) {
+      if (title.includes('|')) {
+        const parts = title.split('|');
+        const taskPart = parts[0].trim();
+        if (taskPart && !['codex', 'bash', 'zsh'].includes(taskPart.toLowerCase())) {
+          return taskPart;
+        }
+      } else if (!['codex', 'bash', 'zsh'].includes(title.toLowerCase())) {
+        return title;
+      }
+    }
+
+    // 备选：根据当前 Pane 的 cwd，从 ~/.codex/state_5.sqlite 中匹配当前项目的活跃会话
+    try {
+      const dbPath = path.join(HOME, '.codex', 'state_5.sqlite');
+      if (fs.existsSync(dbPath) && cwd) {
+        const query = `SELECT title, first_user_message FROM threads WHERE cwd='${cwd.replace(/'/g, "''")}' ORDER BY updated_at DESC LIMIT 1;`;
+        const out = execSync(`sqlite3 "${dbPath}" "${query}"`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+        if (out) {
+          const parts = out.split('|');
+          const matched = (parts[0] || parts[1] || '').trim();
+          if (matched && !matched.startsWith('<send_user_message_question_reply>')) {
+            return matched;
           }
         }
-      } catch (_) {}
+      }
+    } catch (_) {}
+
+    // 回退：使用 pane.label
+    if (pane.label) {
+      return pane.label;
     }
   }
 
-  // 3. 如果是 Claude Code
+  // 2. 针对 Pi：严格读取当前 Pane 自身挂载的专属 session 文件
+  if (agent === 'pi') {
+    if (pane.agent_session && pane.agent_session.value) {
+      const sessionFile = pane.agent_session.value;
+      if (fs.existsSync(sessionFile)) {
+        try {
+          const lines = fs.readFileSync(sessionFile, 'utf-8').trim().split('\n');
+          for (let i = lines.length - 1; i >= Math.max(0, lines.length - 40); i--) {
+            const item = JSON.parse(lines[i]);
+            if (item.message && item.message.role === 'user') {
+              const content = item.message.content || [];
+              const textParts = content.filter(c => c.type === 'text' && c.text).map(c => c.text.trim());
+              const full = textParts.join(' ').trim();
+              if (full) return full;
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    // 回退：终端标题或 label
+    if (pane.label) return pane.label;
+    const title = (pane.terminal_title_stripped || pane.terminal_title || '').trim();
+    if (title && !title.startsWith('π -') && !['bash', 'zsh'].includes(title.toLowerCase())) {
+      return title;
+    }
+  }
+
+  // 3. 针对 Claude Code：匹配对应项目的会话
   if (agent === 'claude') {
-    const claudeHistory = path.join(HOME, '.claude', 'history.jsonl');
-    if (fs.existsSync(claudeHistory)) {
-      try {
-        const lines = fs.readFileSync(claudeHistory, 'utf-8').trim().split('\n');
-        for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
-          const item = JSON.parse(lines[i]);
-          if (item.prompt && item.prompt.trim()) {
-            return item.prompt.trim();
-          }
-        }
-      } catch (_) {}
+    const title = (pane.terminal_title_stripped || pane.terminal_title || '').trim();
+    if (title && !['claude', 'bash', 'zsh'].includes(title.toLowerCase())) {
+      if (title.includes('|')) return title.split('|')[0].trim();
+      return title;
     }
+    if (pane.label) return pane.label;
   }
 
-  // 4. 回退：如果有 stripped 终端标题，且非通用标题，使用终端标题
-  if (pane.terminal_title_stripped) {
-    const t = pane.terminal_title_stripped.trim();
-    if (t && !t.startsWith('π -') && !t.startsWith('bash') && !t.startsWith('zsh')) {
-      return t;
-    }
-  }
-
-  // 5. 回退：使用 pane.label
-  if (pane.label) {
-    return pane.label;
+  // 4. 通用兜底
+  if (pane.label) return pane.label;
+  const genericTitle = (pane.terminal_title_stripped || pane.terminal_title || '').trim();
+  if (genericTitle && !['bash', 'zsh', 'sh'].includes(genericTitle.toLowerCase())) {
+    if (genericTitle.includes('|')) return genericTitle.split('|')[0].trim();
+    return genericTitle;
   }
 
   return '';
 }
 
-// 格式化任务文本为适合侧边栏单行展示的紧凑摘要（最多 25 字符）
+// 格式化任务文本为适合侧边栏展示的紧凑摘要（最多 25 字符）
 function formatTaskSnippet(rawText) {
   if (!rawText) return '';
   const firstLine = rawText.split('\n')[0].trim();
-  // 移除常见前缀
+  // 移除常见无实质意义前缀
   const cleaned = firstLine.replace(/^(请帮我|帮我|请|查看|分析|执行)\s*/, '');
   if (cleaned.length > 25) {
     return cleaned.slice(0, 24) + '…';
@@ -113,7 +135,6 @@ function syncTasks() {
 
   const panes = paneList.result.panes;
   for (const pane of panes) {
-    // 仅针对有识别出 agent 的窗格同步任务
     if (!pane.agent) continue;
 
     const taskText = getLatestTaskForPane(pane);
@@ -121,13 +142,12 @@ function syncTasks() {
 
     if (!snippet) continue;
 
+    // 只有发生变化时才调用 report-metadata
     if (lastReportedTask[pane.pane_id] === snippet) {
-      continue; // 无变化跳过
+      continue;
     }
 
     try {
-      // 通过官方 report-metadata 上报 $task token
-      // 避免特殊字符 shell 转义问题，使用安全替换
       const safeTokenVal = snippet.replace(/["\\`$]/g, '');
       execSync(`${HERDR_BIN} pane report-metadata ${pane.pane_id} --source herdr-prompt-history --token task="${safeTokenVal}"`, {
         stdio: 'ignore'
@@ -140,7 +160,7 @@ function syncTasks() {
 // 首次执行
 syncTasks();
 
-// 如果作为独立守护进程运行（带 --daemon 参数），则启动轮询
+// 如果带 --daemon 参数，则持续轮询
 if (process.argv.includes('--daemon')) {
   setInterval(syncTasks, 2000);
 }
